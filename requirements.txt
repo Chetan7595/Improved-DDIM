@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+einops
+pillow
+tensorboard
+tqdm
+termcolor
+pytorch-fid
+pyyaml
+six
+imageio
