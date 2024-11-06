@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 
 class GaussianDiffusion(nn.Module):
-    def __init__(self, model, image_size, time_step=1000, loss_type='l2'):
+    def __init__(self, model, image_size, time_step=1000, loss_type='l2', base_step_size=0.1, min_step=0.01, max_step=0.5):
         """
         Diffusion model. It is based on Denoising Diffusion Probabilistic Models (DDPM), Jonathan Ho et al.
         :param model: U-net model for de-noising network
@@ -20,93 +20,90 @@ class GaussianDiffusion(nn.Module):
         self.image_size = image_size
         self.time_step = time_step
         self.loss_type = loss_type
+        self.base_step_size = base_step_size
+        self.min_step = min_step
+        self.max_step = max_step
 
-        beta = self.linear_beta_schedule()  # (t, )  t=time_step, in DDPM paper t=1000
-        alpha = 1. - beta  # (a1, a2, a3, ... at)
-        alpha_bar = torch.cumprod(alpha, dim=0)  # (a1, a1*a2, a1*a2*a3, ..., a1*a2*~*at)
-        alpha_bar_prev = F.pad(alpha_bar[:-1], pad=(1, 0), value=1.)  # (1, a1, a1*a2, ..., a1*a2*~*a(t-1))
+        beta = self.linear_beta_schedule()
+        alpha = 1. - beta
+        alpha_bar = torch.cumprod(alpha, dim=0)
+        alpha_bar_prev = F.pad(alpha_bar[:-1], pad=(1, 0), value=1.)
 
         self.register_buffer('beta', beta)
         self.register_buffer('alpha', alpha)
         self.register_buffer('alpha_bar', alpha_bar)
         self.register_buffer('alpha_bar_prev', alpha_bar_prev)
-
-        # calculation for q(x_t | x_0) consult (4) in DDPM paper.
         self.register_buffer('sqrt_alpha_bar', torch.sqrt(alpha_bar))
         self.register_buffer('sqrt_one_minus_alpha_bar', torch.sqrt(1 - alpha_bar))
-
-        # calculation for q(x_{t-1} | x_t, x_0) consult (7) in DDPM paper.
         self.register_buffer('beta_tilde', beta * ((1. - alpha_bar_prev) / (1. - alpha_bar)))
         self.register_buffer('mean_tilde_x0_coeff', beta * torch.sqrt(alpha_bar_prev) / (1 - alpha_bar))
         self.register_buffer('mean_tilde_xt_coeff', torch.sqrt(alpha) * (1 - alpha_bar_prev) / (1 - alpha_bar))
-
-        # calculation for x0 consult (9) in DDPM paper.
         self.register_buffer('sqrt_recip_alpha_bar', torch.sqrt(1. / alpha_bar))
         self.register_buffer('sqrt_recip_alpha_bar_min_1', torch.sqrt(1. / alpha_bar - 1))
-
-        # calculation for (11) in DDPM paper.
         self.register_buffer('sqrt_recip_alpha', torch.sqrt(1. / alpha))
         self.register_buffer('beta_over_sqrt_one_minus_alpha_bar', beta / torch.sqrt(1. - alpha_bar))
 
-    # Forward Process / Diffusion Process ##############################################################################
+    def compute_complexity(self, x):
+    # Add padding to maintain input dimensions
+        padding = 1
+        
+        # Define a 2D kernel with 1 channel and then expand it to match the input channels (3 for RGB)
+        kernel_x = torch.tensor([[[[-1, 1], [0, 0]]]], dtype=torch.float32).repeat(3, 1, 1, 1).to(x.device)
+        kernel_y = torch.tensor([[[[-1, 0], [1, 0]]]], dtype=torch.float32).repeat(3, 1, 1, 1).to(x.device)
+        
+        # Compute gradients along x and y directions with padding
+        grad_x = torch.abs(F.conv2d(x, kernel_x, padding=padding, groups=3))
+        grad_y = torch.abs(F.conv2d(x, kernel_y, padding=padding, groups=3))
+        
+        # Calculate complexity based on gradients
+        complexity = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+        
+        # Normalize the complexity
+        complexity = complexity / (torch.norm(complexity, p=2) + 1e-8)
+        
+        return complexity
+
+
+
+    def adaptive_step_size(self, complexity):
+        dt = self.base_step_size / complexity
+        return dt.clamp(min=self.min_step, max=self.max_step)
+
+    def modified_loss(self, pred_noise, true_noise, complexity, lambda_reg=0.1):
+    # Ensure all tensors have the same spatial dimensions
+        if complexity.shape != pred_noise.shape:
+            complexity = F.interpolate(complexity, size=pred_noise.shape[2:], mode='bilinear', align_corners=False)
+        
+        # Base MSE loss
+        squared_error = F.mse_loss(pred_noise, true_noise)
+        
+        # Complexity-weighted L1 loss
+        complexity_term = torch.mean(complexity * torch.abs(pred_noise - true_noise))
+        
+        # Combined loss
+        return squared_error + lambda_reg * complexity_term
+
     def q_sample(self, x0, t, noise):
-        """
-        Sampling x_t, according to q(x_t | x_0). Consult (4) in DDPM paper.
-        :param x0: (b, c, h, w), original image
-        :param t: (b, ), timestep t
-        :param noise: (b, c, h, w), We calculate q(x_t | x_0) using re-parameterization trick.
-        :return: x_t with shape=(b, c, h, w), which is a noised image at timestep t
-        """
-        # Get x_t ~ q(x_t | x_0) using re-parameterization trick
         return self.sqrt_alpha_bar[t][:, None, None, None] * x0 + \
                self.sqrt_one_minus_alpha_bar[t][:, None, None, None] * noise
 
     def forward(self, img):
-        """
-        Calculate L_simple according to (14) in DDPM paper
-        :param img: (b, c, h, w), original image
-        :return: L_simple
-        """
         b, c, h, w = img.shape
         assert h == self.image_size and w == self.image_size, f'height and width of image must be {self.image_size}'
-        t = torch.randint(0, self.time_step, (b,), device=img.device).long()  # (b, )
-        noise = torch.randn_like(img)  # corresponds to epsilon in (14)
-        noised_image = self.q_sample(img, t, noise)  # argument inside epsilon_theta
-        predicted_noise = self.unet(noised_image, t)  # epsilon_theta in (14)
+        t = torch.randint(0, self.time_step, (b,), device=img.device).long()
+        noise = torch.randn_like(img)
+        noised_image = self.q_sample(img, t, noise)
+        predicted_noise = self.unet(noised_image, t)
 
-        if self.loss_type == 'l1':
-            loss = F.l1_loss(noise, predicted_noise)
-        elif self.loss_type == 'l2':
-            loss = F.mse_loss(noise, predicted_noise)
-        elif self.loss_type == "huber":
-            loss = F.smooth_l1_loss(noise, predicted_noise)
-        else:
-            raise NotImplementedError()
+        # Compute complexity and adaptive loss
+        complexity = self.compute_complexity(noised_image)
+        loss = self.modified_loss(predicted_noise, noise, complexity)
         return loss
 
-    ####################################################################################################################
-
-    # Reverse Process / De-noising Process #############################################################################
     @torch.inference_mode()
     def p_sample(self, xt, t, clip=True):
-        """
-        Sample x_{t-1} from p_{theta}(x_{t-1} | x_t).
-        There are two ways to sample x_{t-1}.
-        One way is to follow paper and this corresponds to line 4 in Algorithm 2 in DDPM paper. (clip==False)
-        Another way is to clip(or clamp) the predicted x_0 to -1 ~ 1 for better sampling result.
-        To clip the x_0 to out desired range, we cannot directly apply (11) to sample x_{t-1}, rather we have to
-        calculate predicted x_0 using (4) and then calculate mu in (7) using that predicted x_0. Which is exactly
-        same calculation except for clipping.
-        As you might easily expect, using clip leads to better sampling result since it
-        restricts sampled images range to -1 ~ 1. Ref: https://github.com/hojonathanho/diffusion/issues/5
-
-        :param xt: ( b, c, h, w), noised image at time step t
-        :param t: ( b, )
-        :param clip: [True, False] Whether to clip predicted x_0 to our desired range -1 ~ 1.
-        :return: de-noised image at time step t-1
-        """
         batched_time = torch.full((xt.shape[0],), t, device=self.device, dtype=torch.long)
-        pred_noise = self.unet(xt, batched_time)  # corresponds to epsilon_{theta}
+        pred_noise = self.unet(xt, batched_time)
         if clip:
             x0 = self.sqrt_recip_alpha_bar[t] * xt - self.sqrt_recip_alpha_bar_min_1[t] * pred_noise
             x0.clamp_(-1., 1.)
@@ -114,41 +111,30 @@ class GaussianDiffusion(nn.Module):
         else:
             mean = self.sqrt_recip_alpha[t] * (xt - self.beta_over_sqrt_one_minus_alpha_bar[t] * pred_noise)
         variance = self.beta_tilde[t]
-        noise = torch.randn_like(xt) if t > 0 else 0.  # corresponds to z, consult 4: in Algorithm 2.
+        noise = torch.randn_like(xt) if t > 0 else 0.
         x_t_minus_1 = mean + torch.sqrt(variance) * noise
         return x_t_minus_1
 
     @torch.inference_mode()
     def sample(self, batch_size=16, return_all_timestep=False, clip=True, min1to1=False):
-        """
-
-        :param batch_size: # of image to generate.
-        :param return_all_timestep: Whether to return all images during de-noising process. So it will return the
-        images from time step T ~ time step 0
-        :param clip: [True, False]. Explanation in p_sample function.
-        :return: Generated image of shape (b, 3, h, w) if return_all_timestep==False else (b, T, 3, h, w)
-        """
         xT = torch.randn([batch_size, self.channel, self.image_size, self.image_size], device=self.device)
         denoised_intermediates = [xT]
         xt = xT
         for t in tqdm(reversed(range(0, self.time_step)), desc='DDPM Sampling', total=self.time_step, leave=False):
+            complexity = self.compute_complexity(xt)
+            adaptive_dt = self.adaptive_step_size(complexity)
+            # Update with adaptive_dt if using custom logic (additional logic may apply)
             x_t_minus_1 = self.p_sample(xt, t, clip)
             denoised_intermediates.append(x_t_minus_1)
             xt = x_t_minus_1
 
         images = xt if not return_all_timestep else torch.stack(denoised_intermediates, dim=1)
-        # images = (images + 1.0) * 0.5  # scale to 0~1
         images.clamp_(min=-1.0, max=1.0)
         if not min1to1:
             images.sub_(-1.0).div_(2.0)
         return images
 
-    ####################################################################################################################
-
     def linear_beta_schedule(self):
-        """
-        linear schedule, proposed in original ddpm paper
-        """
         scale = 1000 / self.time_step
         beta_start = scale * 0.0001
         beta_end = scale * 0.02
